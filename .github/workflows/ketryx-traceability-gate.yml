@@ -1,0 +1,81 @@
+name: Ketryx traceability gate
+
+# Blocking PR check: every regulated change must trace to a requirement and be verified
+# by a test before it merges - the rule Ketryx enforces at release, moved to the PR.
+# Static trace checks, then a Ketryx read-back at a HIDDEN version pinned to the PR head
+# (deleted when the PR closes). Posts one sticky PR comment with each gap and its fix.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+concurrency:
+  group: ketryx-trace-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+env:
+  KETRYX_URL: https://demo.ketryx.com
+
+jobs:
+  gate:
+    name: Ketryx traceability gate
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Collect changed files
+        id: diff
+        run: |
+          { echo 'files<<KXEOF'; git diff --name-only --diff-filter=ACMR "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"; echo 'KXEOF'; } >> "$GITHUB_OUTPUT"
+      - name: Pin a hidden Ketryx version to the PR head commit
+        id: version
+        env:
+          API_KEY: ${{ secrets.KETRYX_GATE_API_KEY }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          r=$(curl -sS -X POST "$KETRYX_URL/api/v1/projects/${{ vars.KETRYX_PROJECT }}/versions?idempotentKey=pr-$PR-$SHA" \
+            -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg n "PR-$PR-${SHA:0:7}" --arg u "https://github.com/${{ github.repository }}" --arg s "$SHA" '{name:$n,visibility:"HIDDEN",repositorySettings:[{url:$u,releaseRefPattern:$s}]}')")
+          id=$(echo "$r" | jq -r '.id // empty'); [ -z "$id" ] && echo "::warning::No hidden version: $r"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+      - name: Run traceability gate
+        env:
+          KETRYX_PROJECT: ${{ vars.KETRYX_PROJECT }}
+          KETRYX_API_KEY: ${{ secrets.KETRYX_GATE_API_KEY }}
+          KETRYX_VERSION_ID: ${{ steps.version.outputs.id }}
+          CHANGED_FILES: ${{ steps.diff.outputs.files }}
+        run: node .github/scripts/trace-gate.mjs
+      - name: Post or update the gate comment
+        if: always() && hashFiles('trace-gate-report.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          cat trace-gate-report.md >> "$GITHUB_STEP_SUMMARY"
+          id=$(gh api "repos/${{ github.repository }}/issues/$PR/comments" --paginate --jq '.[] | select(.body | startswith("<!-- ketryx-trace-gate -->")) | .id' | tail -1)
+          if [ -n "$id" ]; then gh api -X PATCH "repos/${{ github.repository }}/issues/comments/$id" -F body=@trace-gate-report.md >/dev/null; else gh pr comment "$PR" --body-file trace-gate-report.md; fi
+
+  cleanup:
+    name: Delete the PR-pinned Ketryx version
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          API_KEY: ${{ secrets.KETRYX_GATE_API_KEY }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          id=$(curl -sS -X POST "$KETRYX_URL/api/v1/projects/${{ vars.KETRYX_PROJECT }}/versions?idempotentKey=pr-$PR-$SHA" \
+            -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg n "PR-$PR-${SHA:0:7}" --arg u "https://github.com/${{ github.repository }}" --arg s "$SHA" '{name:$n,visibility:"HIDDEN",repositorySettings:[{url:$u,releaseRefPattern:$s}]}')" | jq -r '.id // empty')
+          [ -z "$id" ] && exit 0
+          curl -sS -o /dev/null -w "Deleted $id: HTTP %{http_code}\n" -X DELETE "$KETRYX_URL/api/v1/projects/${{ vars.KETRYX_PROJECT }}/versions/$id" -H "Authorization: Bearer $API_KEY"
