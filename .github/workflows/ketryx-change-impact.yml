@@ -1,0 +1,83 @@
+name: Ketryx change impact
+
+# On every pull request, Claude Code walks the blast radius of the diff through the
+# Ketryx MCP server - requirements (Jama), specs, risks and tests the touched code
+# traces to - and posts ONE sticky PR comment: verdict, impacted design controls,
+# risk, re-verification, documents to regenerate, and whether a Change Request is needed.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ketryx-change-impact-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  impact:
+    name: Ketryx change impact assessment
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: anthropics/claude-code-action@v1
+        env:
+          KETRYX_API_KEY: ${{ secrets.KETRYX_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are performing a regulated change-impact assessment of pull request
+            #${{ github.event.pull_request.number }} in ${{ github.repository }}: the
+            real-time waveform processing and rendering engine of the Intraoperative
+            Neuromonitoring (IONM) System (IEC 62304 / ISO 14971).
+
+            Regulated scope: src/**, specs/**, features/**. Everything else is non-regulated.
+            Trace edges are in the source: `itemFulfills` frontmatter in specs/*.md and
+            `@tests:` tags on Cucumber scenarios in features/. Targets are Ketryx item ids
+            (KXITM...). Requirements are authored in Jama (document keys like D25-SOFTR-4);
+            risks are Jama Risk Evaluations (D25-RISK-*), linked to their controls.
+
+            The Ketryx project is `${{ vars.KETRYX_PROJECT }}` on https://demo.ketryx.com.
+            Use the Ketryx MCP tools (mcp__ketryx__*): hybrid_search_items,
+            get_item_records (include relationships), resolve_references - scoped to that
+            project (include referenced projects where relevant).
+
+            Steps:
+            1. Read the diff: `gh pr diff ${{ github.event.pull_request.number }}`.
+            2. Identify the regulated behavior that changes and the Ketryx items the touched
+               code traces to (from its tags).
+            3. In Ketryx, walk ONE hop up (requirements fulfilled, risks controlled) and ONE
+               hop down (tests verifying them). Also find items whose TEXT states a value
+               this diff changes (e.g. a latency budget in ms) - stale-text impacts - even
+               if they are not tagged.
+            4. Verdict: HIGH-IMPACT if it changes behavior a requirement, spec or risk
+               control states; LOW-IMPACT otherwise. When unsure, HIGH-IMPACT.
+            5. Write the comment to a file and post it ONCE with
+               `gh pr comment ${{ github.event.pull_request.number }} --body-file <file>`.
+               First line must be `<!-- ketryx-change-impact -->`, then:
+               - `## Change impact: HIGH-IMPACT` or `## Change impact: LOW-IMPACT`
+               - **What changed** - 2-3 plain-language bullets (behavior, not code)
+               - **Impacted design controls** - table: Item | Source (Jama/Git) | Why impacted |
+                 Action (update text / re-verify / no change). Use titles and Jama document
+                 keys exactly as Ketryx returns them, with Ketryx links.
+               - **Risk** - risks whose controls are touched; should residual risk be re-evaluated?
+               - **Re-verification** - tests to re-run, and changed behavior NO test covers
+               - **Documents to regenerate** - only those the impacted items appear in
+               - **Required next step** - HIGH-IMPACT: "Open a Change Request in Ketryx and get
+                 it approved before merge." LOW-IMPACT: "Standard review; no Change Request required."
+               Never invent ids; if Ketryx does not return an item, say "not found in Ketryx".
+
+            Assess only what this PR changes. Do not modify files.
+          claude_args: |
+            --mcp-config .github/mcp-config.json
+            --model sonnet
+            --max-turns 40
+            --allowedTools "mcp__ketryx__*,Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr comment:*),Write,Read,Grep,Glob"

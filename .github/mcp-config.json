@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ketryx": {
+      "type": "http",
+      "url": "https://demo.ketryx.com/api/mcp",
+      "headers": { "Authorization": "Bearer ${KETRYX_API_KEY}" }
+    }
+  }
+}
